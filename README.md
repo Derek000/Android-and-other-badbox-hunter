@@ -1,8 +1,8 @@
 # BadBox Hunter
 
 Network and traffic-based helper for spotting suspicious Android / IoT devices
-(including pre-infected “BadBox”-style devices) on networks **you own or are
-explicitly authorised to test**.
+(including pre-infected “BadBox”-style devices) on networks you own or are
+explicitly authorised to test.
 
 **Features**
 
@@ -26,7 +26,7 @@ force, or attempt rooting.
 ## Quick start (CLI)
 
 ```bash
-git clone https://github.com/<your-account>/badbox-hunter.git
+git clone https://github.com/Derek000/Android-and-other-badbox-hunter.git
 cd badbox-hunter
 
 python3 -m venv .venv
