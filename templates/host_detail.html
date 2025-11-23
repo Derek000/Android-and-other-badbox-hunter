@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>BadBox Hunter – Host {{ host.ip }}</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+  <header>
+    <h1>Host details – {{ host.ip }}</h1>
+    <p>Deep-dive into a single asset based on the last assessment run.</p>
+  </header>
+
+  <main>
+    <section class="actions">
+      <a href="{{ url_for('index') }}" class="button">← New assessment</a>
+      <a href="{{ url_for('api_report') }}" class="button secondary">Download full JSON report</a>
+    </section>
+
+    <section class="host-summary">
+      <h2>Summary</h2>
+      <dl>
+        <dt>IP</dt><dd>{{ host.ip }}</dd>
+        <dt>Hostname</dt><dd>{{ host.hostname or "n/a" }}</dd>
+        <dt>OS guess</dt><dd>{{ host.os_guess or "n/a" }}</dd>
+        <dt>Tags</dt><dd>{{ ", ".join(host.tags or []) }}</dd>
+        {% set risk = host.ioc_hits.risk if host.ioc_hits and host.ioc_hits.risk is defined else None %}
+        {% if risk %}
+          <dt>Risk level</dt><dd>{{ risk.level }} (score {{ risk.score }})</dd>
+        {% endif %}
+      </dl>
+    </section>
+
+    <section>
+      <h2>Services</h2>
+      {% if host.services %}
+        <table>
+          <thead>
+            <tr>
+              <th>Port</th>
+              <th>Protocol</th>
+              <th>Service</th>
+              <th>Banner</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for s in host.services %}
+              <tr>
+                <td>{{ s.port }}</td>
+                <td>{{ s.protocol }}</td>
+                <td>{{ s.service }}</td>
+                <td>{{ s.banner }}</td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      {% else %}
+        <p>No open services recorded.</p>
+      {% endif %}
+    </section>
+
+    <section>
+      <h2>Indicators and evidence</h2>
+      {% if not host.ioc_hits %}
+        <p>No IoC hits recorded for this host.</p>
+      {% else %}
+        <ul>
+          {% for key, value in host.ioc_hits.items() %}
+            {% if key != "risk" %}
+              <li>
+                <strong>{{ key }}</strong>:
+                <pre>{{ value | tojson(indent=2) }}</pre>
+              </li>
+            {% endif %}
+          {% endfor %}
+        </ul>
+      {% endif %}
+    </section>
+
+    {% if host.ssh_uname or host.ssh_ps or host.ssh_netstat %}
+      <section>
+        <h2>SSH enrichment</h2>
+        {% if host.ssh_uname %}
+          <h3>uname -a</h3>
+          <pre>{{ host.ssh_uname }}</pre>
+        {% endif %}
+        {% if host.ssh_ps %}
+          <h3>ps auxw | head -n 25</h3>
+          <pre>{{ host.ssh_ps }}</pre>
+        {% endif %}
+        {% if host.ssh_netstat %}
+          <h3>netstat -tunp | head -n 25</h3>
+          <pre>{{ host.ssh_netstat }}</pre>
+        {% endif %}
+      </section>
+    {% endif %}
+  </main>
+</body>
+</html>

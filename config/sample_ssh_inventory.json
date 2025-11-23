@@ -1,0 +1,8 @@
+[
+  {
+    "ip": "192.168.0.10",
+    "user": "pi",
+    "auth": "key",
+    "key_path": "~/.ssh/id_rsa"
+  }
+]

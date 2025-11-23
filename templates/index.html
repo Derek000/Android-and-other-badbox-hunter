@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>BadBox Hunter</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+  <header>
+    <h1>BadBox Hunter – Network &amp; PCAP Assessment</h1>
+    <p>Run authorised assessments of your own networks and devices.</p>
+  </header>
+
+  {% with messages = get_flashed_messages(with_categories=true) %}
+    {% if messages %}
+      <div class="flash-container">
+        {% for category, message in messages %}
+          <div class="flash {{ category }}">{{ message }}</div>
+        {% endfor %}
+      </div>
+    {% endif %}
+  {% endwith %}
+
+  <main>
+    <form method="post" enctype="multipart/form-data" class="form-panel">
+      <section>
+        <h2>1. Network scope</h2>
+        <label for="cidrs">CIDR ranges to scan (comma separated)</label>
+        <input type="text" id="cidrs" name="cidrs" value="{{ default_cidrs }}"
+               placeholder="192.168.0.0/24, 10.0.0.0/24" required>
+
+        <label for="exclude_ips">Exclude IPs (optional, comma separated)</label>
+        <input type="text" id="exclude_ips" name="exclude_ips"
+               placeholder="192.168.0.1, 192.168.0.254">
+      </section>
+
+      <section>
+        <h2>2. Optional PCAP upload</h2>
+        <p>Upload one or more PCAP files captured with <code>tcpdump</code> or Wireshark.</p>
+        <input type="file" id="pcaps" name="pcaps" multiple>
+      </section>
+
+      <section>
+        <h2>3. Optional live capture</h2>
+        <p>If the container has the right privileges and you want a short <code>tcpdump</code> capture:</p>
+        <label for="capture_iface">Capture interface (optional)</label>
+        <input type="text" id="capture_iface" name="capture_iface" placeholder="eth0 or wlan0">
+
+        <label for="capture_seconds">Capture duration (seconds, default 60)</label>
+        <input type="number" id="capture_seconds" name="capture_seconds"
+               min="10" max="600" value="60">
+      </section>
+
+      <section>
+        <h2>4. Optional SSH enrichment</h2>
+        <p>If an SSH inventory JSON is available inside the container, specify its path.</p>
+        <label for="ssh_inventory_path">SSH inventory JSON path (optional)</label>
+        <input type="text" id="ssh_inventory_path" name="ssh_inventory_path"
+               placeholder="/app/config/ssh_inventory.json">
+      </section>
+
+      <section>
+        <h2>5. Run assessment</h2>
+        <button type="submit">Start assessment</button>
+      </section>
+
+      <section class="notice">
+        <p><strong>Important:</strong> Only use this tool on networks and devices you own or are explicitly authorised to test.</p>
+      </section>
+    </form>
+  </main>
+</body>
+</html>

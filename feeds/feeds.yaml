@@ -1,0 +1,33 @@
+# feeds/feeds.yaml
+#
+# Defines external threat intel feeds that can be normalised into
+# iocs/domains.txt and iocs/ips.txt by update_feeds.py.
+#
+# IMPORTANT: respect each provider's terms of use. This file is a sample
+# only; you should review and adjust endpoints, enable/disable feeds,
+# and set API keys via environment variables where required.
+
+abusech_urlhaus:
+  enabled: true
+  type: urlhaus
+  url: "https://urlhaus.abuse.ch/downloads/csv/"
+
+abusech_sslbl_c2_ips:
+  enabled: true
+  type: sslbl_ips
+  url: "https://sslbl.abuse.ch/blacklist/sslipblacklist.csv"
+
+otx_example:
+  enabled: false
+  type: otx_pulses
+  api_url: "https://otx.alienvault.com/api/v1"
+  api_key_env: "OTX_API_KEY"
+  pulses:
+    - "000000000000000000000000"  # replace with real pulse IDs
+
+shadowserver_client_csv:
+  enabled: false
+  type: shadowserver_csv
+  paths:
+    - "feeds/shadowserver/sample_report.csv"
+  ip_column: "ip"
