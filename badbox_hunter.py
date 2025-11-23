@@ -67,6 +67,7 @@ class NetworkScanner:
         for cidr in self.cidrs:
             LOG.info("Scanning network %s with nmap, this may take a while...", cidr)
             cmd = ["nmap", "-sS", "-sV", "-O", "-oX", "-", cidr]
+            # WSL alternative cmd = ["nmap", "-sT", "-sV", "-O", "-Pn", "-oX", "-", cidr]
             try:
                 proc = subprocess.run(
                     cmd, capture_output=True, text=True, check=True
