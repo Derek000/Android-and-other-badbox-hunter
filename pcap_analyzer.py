@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
-"""
-PCAP / Wi-Fi traffic analyzer for BadBox Hunter.
+# -*- coding: utf-8 -*-
 
-Offline-only: parses PCAP files and correlates traffic with IoCs.
-"""
+"""PCAP analysis for BadBox Hunter.
 
-from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Dict, List, Optional
+Uses tshark/pyshark to identify flows that touch IoC domains/IPs.
+"""
 
 import logging
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Dict, List
 
-import pyshark  # requires tshark installed
+import pyshark  # type: ignore
 
 from ioc_store import IoCStore
 
@@ -19,106 +19,92 @@ LOG = logging.getLogger("pcap_analyzer")
 
 
 @dataclass
-class FlowSuspicion:
-    src_ip: str
-    dst_ip: str
-    dst_port: Optional[int]
-    proto: str
-    reasons: List[str] = field(default_factory=list)
-    matched_iocs: Dict[str, List[str]] = field(default_factory=dict)
+class PCAPAnalysisResult:
+    flows: List[Dict[str, Any]] = field(default_factory=list)
 
 
-class PcapAnalyzer:
-    """Lightweight IoC-driven analysis on PCAPs.
+def analyse_pcap(pcap_path: Path, iocs: IoCStore) -> PCAPAnalysisResult:
+    """Scan a PCAP for basic IoC hits.
 
-    Heuristics:
-      - DNS queries against suspicious domains
-      - Connections to IoC IPs
-      - HTTP Host headers / TLS SNI matching suspicious domains / patterns
+    This is intentionally simple and conservative.
     """
+    result = PCAPAnalysisResult()
+    if not pcap_path.exists():
+        LOG.error("PCAP file %s does not exist", pcap_path)
+        return result
 
-    def __init__(self, iocs: IoCStore):
-        self.iocs = iocs
+    LOG.info("Analysing PCAP %s for IoC hits...", pcap_path)
+    try:
+        cap = pyshark.FileCapture(str(pcap_path), only_summaries=False)
+    except Exception as e:  # pragma: no cover - environment specific
+        LOG.error("Failed to open PCAP %s with pyshark: %s", pcap_path, e)
+        return result
 
-    def analyze_files(self, pcaps: List[Path]) -> List[FlowSuspicion]:
-        results: Dict[str, FlowSuspicion] = {}
-        for pcap in pcaps:
-            if not pcap.exists():
-                LOG.warning("PCAP %s not found, skipping", pcap)
-                continue
-            LOG.info("Analyzing PCAP %s ...", pcap)
-            self._analyze_single(pcap, results)
-        return list(results.values())
+    # Limit packet count so we don't explode on very large files
+    max_packets = 10000
+    count = 0
 
-    def _analyze_single(self, pcap: Path, flows: Dict[str, FlowSuspicion]) -> None:
-        cap = pyshark.FileCapture(str(pcap), use_json=True)
-        for pkt in cap:
-            try:
-                self._handle_packet(pkt, flows)
-            except Exception as e:  # noqa: BLE001
-                LOG.debug("Error parsing packet: %s", e)
+    for pkt in cap:
+        count += 1
+        if count > max_packets:
+            LOG.info("Stopping PCAP analysis after %d packets (limit).", max_packets)
+            break
+
+        flow: Dict[str, Any] = {}
+        try:
+            if "ip" in pkt:
+                flow["src_ip"] = getattr(pkt.ip, "src", None)
+                flow["dst_ip"] = getattr(pkt.ip, "dst", None)
+            elif "ipv6" in pkt:
+                flow["src_ip"] = getattr(pkt.ipv6, "src", None)
+                flow["dst_ip"] = getattr(pkt.ipv6, "dst", None)
+        except Exception:
+            pass
+
+        # Basic protocol markers
+        proto = getattr(getattr(pkt, "highest_layer", None), "lower", lambda: "")()
+        flow["proto"] = proto
+
+        # Extract candidate domains: DNS, HTTP host, TLS SNI
+        domains = set()
+        try:
+            if hasattr(pkt, "dns") and hasattr(pkt.dns, "qry_name"):
+                domains.add(str(pkt.dns.qry_name))
+        except Exception:
+            pass
+        try:
+            if hasattr(pkt, "http") and hasattr(pkt.http, "host"):
+                domains.add(str(pkt.http.host))
+        except Exception:
+            pass
+        try:
+            if hasattr(pkt, "tls") and hasattr(pkt.tls, "handshake_extensions_server_name"):
+                domains.add(str(pkt.tls.handshake_extensions_server_name))
+        except Exception:
+            pass
+
+        ioc_hits: List[str] = []
+
+        for d in domains:
+            if iocs.match_domain(d):
+                ioc_hits.append(f"domain:{d}")
+
+        for key in ("src_ip", "dst_ip"):
+            ip = flow.get(key)
+            if ip and iocs.match_ip(ip):
+                ioc_hits.append(f"ip:{ip}")
+
+        if not ioc_hits:
+            continue
+
+        flow["domains"] = list(domains)
+        flow["ioc_hits"] = ioc_hits
+        result.flows.append(flow)
+
+    try:
         cap.close()
+    except Exception:
+        pass
 
-    def _handle_packet(self, pkt, flows: Dict[str, FlowSuspicion]) -> None:
-        ip_layer = getattr(pkt, "ip", None) or getattr(pkt, "ipv6", None)
-        if not ip_layer:
-            return
-
-        src_ip = getattr(ip_layer, "src", None)
-        dst_ip = getattr(ip_layer, "dst", None)
-        if not src_ip or not dst_ip:
-            return
-
-        proto = pkt.highest_layer
-        dst_port = None
-        if hasattr(pkt, "tcp"):
-            dst_port = int(pkt.tcp.dstport)
-        elif hasattr(pkt, "udp"):
-            dst_port = int(pkt.udp.dstport)
-
-        key = f"{src_ip}>{dst_ip}:{dst_port or 0}"
-        flow = flows.get(key)
-        if not flow:
-            flow = FlowSuspicion(
-                src_ip=src_ip,
-                dst_ip=dst_ip,
-                dst_port=dst_port,
-                proto=proto,
-            )
-            flows[key] = flow
-
-        # DNS queries
-        if hasattr(pkt, "dns") and hasattr(pkt.dns, "qry_name"):
-            qname = str(pkt.dns.qry_name).lower()
-            for dom in self.iocs.domains:
-                if dom.lower() in qname:
-                    flow.reasons.append(f"dns_query_to_suspicious_domain:{qname}")
-                    flow.matched_iocs.setdefault("domains", []).append(dom)
-
-        # IP-based IoCs
-        for bad_ip in self.iocs.ips:
-            if dst_ip == bad_ip or src_ip == bad_ip:
-                flow.reasons.append(f"ip_contact_with_ioc:{bad_ip}")
-                flow.matched_iocs.setdefault("ips", []).append(bad_ip)
-
-        # HTTP Host header
-        if hasattr(pkt, "http") and hasattr(pkt.http, "host"):
-            host = str(pkt.http.host).lower()
-            for dom in self.iocs.domains:
-                if dom.lower() in host:
-                    flow.reasons.append(f"http_host_matches_ioc:{host}")
-                    flow.matched_iocs.setdefault("domains", []).append(dom)
-
-        # TLS SNI
-        tls = getattr(pkt, "tls", None) or getattr(pkt, "ssl", None)
-        if tls and hasattr(tls, "handshake_extensions_server_name"):
-            sni = str(tls.handshake_extensions_server_name).lower()
-            for dom in self.iocs.domains:
-                if dom.lower() in sni:
-                    flow.reasons.append(f"tls_sni_matches_ioc:{sni}")
-                    flow.matched_iocs.setdefault("domains", []).append(dom)
-
-        # Deduplicate
-        flow.reasons = sorted(set(flow.reasons))
-        for k in list(flow.matched_iocs.keys()):
-            flow.matched_iocs[k] = sorted(set(flow.matched_iocs[k]))
+    LOG.info("PCAP analysis complete, %d flows with IoC hits.", len(result.flows))
+    return result

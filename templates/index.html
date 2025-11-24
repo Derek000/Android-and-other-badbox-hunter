@@ -1,73 +1,142 @@
 <!doctype html>
 <html lang="en">
 <head>
-  <meta charset="utf-8">
-  <title>BadBox Hunter</title>
-  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+    <meta charset="utf-8">
+    <title>BadBox Hunter Web UI</title>
+    <style>
+        body { font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 1.5rem; }
+        textarea, input, select { width: 100%; box-sizing: border-box; margin-bottom: 0.5rem; }
+        label { font-weight: 600; margin-top: 0.75rem; display: block; }
+        .row { display: flex; gap: 1rem; flex-wrap: wrap; }
+        .col { flex: 1 1 280px; }
+        table { border-collapse: collapse; width: 100%; margin-top: 1rem; }
+        th, td { border: 1px solid #ccc; padding: 0.4rem 0.5rem; font-size: 0.9rem; }
+        th { background: #f5f5f5; text-align: left; }
+        .risk-high { background: #ffe5e5; }
+        .risk-medium { background: #fff5e0; }
+        .risk-low { background: #e9f5ff; }
+        .metrics { margin-top: 1rem; padding: 0.75rem; background: #f5f5f5; border-radius: 4px; }
+        .btn { padding: 0.4rem 0.8rem; border-radius: 4px; border: 1px solid #444; background: #222; color: #fff; cursor: pointer; }
+        .btn-secondary { background: #fff; color: #222; border-color: #999; text-decoration: none; }
+        details { margin-top: 1rem; }
+        pre { background: #111; color: #eee; padding: 0.75rem; overflow: auto; font-size: 0.8rem; }
+    </style>
 </head>
 <body>
-  <header>
-    <h1>BadBox Hunter – Network &amp; PCAP Assessment</h1>
-    <p>Run authorised assessments of your own networks and devices.</p>
-  </header>
+    <h1>BadBox Hunter – Web Assessment</h1>
+    <p>Run a targeted assessment of your local network, Android, IoT and other devices. For deeper automation and logging, use the CLI.</p>
 
-  {% with messages = get_flashed_messages(with_categories=true) %}
-    {% if messages %}
-      <div class="flash-container">
-        {% for category, message in messages %}
-          <div class="flash {{ category }}">{{ message }}</div>
-        {% endfor %}
-      </div>
-    {% endif %}
-  {% endwith %}
+    <form method="post" enctype="multipart/form-data">
+        <div class="row">
+            <div class="col">
+                <label for="cidrs">CIDR ranges</label>
+                <textarea id="cidrs" name="cidrs" rows="3" required>{{ form.cidrs }}</textarea>
+                <small>One CIDR per line, e.g. <code>192.168.1.0/24</code></small>
+            </div>
+            <div class="col">
+                <label for="exclude_ips">Exclude IPs (optional)</label>
+                <textarea id="exclude_ips" name="exclude_ips" rows="3">{{ form.exclude_ips }}</textarea>
+                <small>One IP per line to ignore in results.</small>
+            </div>
+        </div>
 
-  <main>
-    <form method="post" enctype="multipart/form-data" class="form-panel">
-      <section>
-        <h2>1. Network scope</h2>
-        <label for="cidrs">CIDR ranges to scan (comma separated)</label>
-        <input type="text" id="cidrs" name="cidrs" value="{{ default_cidrs }}"
-               placeholder="192.168.0.0/24, 10.0.0.0/24" required>
+        <div class="row">
+            <div class="col">
+                <label for="scan_engine">Scan engine</label>
+                <select id="scan_engine" name="scan_engine">
+                    <option value="nmap" {% if form.scan_engine == "nmap" %}selected{% endif %}>nmap (TCP connect, conservative)</option>
+                    <option value="masscan" {% if form.scan_engine == "masscan" %}selected{% endif %}>masscan + nmap (fast, raw sockets)</option>
+                </select>
+            </div>
+            <div class="col">
+                <label for="max_retries">Max retries per port</label>
+                <input type="number" id="max_retries" name="max_retries" min="0" value="{{ form.max_retries }}">
+                <small>Passed to <code>nmap --max-retries</code>. Default: 1.</small>
+            </div>
+            <div class="col">
+                <label for="timeout_per_host">Host timeout</label>
+                <input type="text" id="timeout_per_host" name="timeout_per_host" value="{{ form.timeout_per_host }}">
+                <small>Passed to <code>nmap --host-timeout</code>, e.g. <code>60s</code>, <code>2m</code>.</small>
+            </div>
+        </div>
 
-        <label for="exclude_ips">Exclude IPs (optional, comma separated)</label>
-        <input type="text" id="exclude_ips" name="exclude_ips"
-               placeholder="192.168.0.1, 192.168.0.254">
-      </section>
+        <div class="row">
+            <div class="col">
+                <label for="pcap">Optional PCAP upload</label>
+                <input type="file" id="pcap" name="pcap" accept=".pcap,.pcapng">
+                <small>If provided, flows with IoC hits will be correlated against discovered hosts.</small>
+            </div>
+        </div>
 
-      <section>
-        <h2>2. Optional PCAP upload</h2>
-        <p>Upload one or more PCAP files captured with <code>tcpdump</code> or Wireshark.</p>
-        <input type="file" id="pcaps" name="pcaps" multiple>
-      </section>
-
-      <section>
-        <h2>3. Optional live capture</h2>
-        <p>If the container has the right privileges and you want a short <code>tcpdump</code> capture:</p>
-        <label for="capture_iface">Capture interface (optional)</label>
-        <input type="text" id="capture_iface" name="capture_iface" placeholder="eth0 or wlan0">
-
-        <label for="capture_seconds">Capture duration (seconds, default 60)</label>
-        <input type="number" id="capture_seconds" name="capture_seconds"
-               min="10" max="600" value="60">
-      </section>
-
-      <section>
-        <h2>4. Optional SSH enrichment</h2>
-        <p>If an SSH inventory JSON is available inside the container, specify its path.</p>
-        <label for="ssh_inventory_path">SSH inventory JSON path (optional)</label>
-        <input type="text" id="ssh_inventory_path" name="ssh_inventory_path"
-               placeholder="/app/config/ssh_inventory.json">
-      </section>
-
-      <section>
-        <h2>5. Run assessment</h2>
-        <button type="submit">Start assessment</button>
-      </section>
-
-      <section class="notice">
-        <p><strong>Important:</strong> Only use this tool on networks and devices you own or are explicitly authorised to test.</p>
-      </section>
+        <div style="margin-top: 1rem;">
+            <button type="submit" class="btn">Run assessment</button>
+            {% if report_json %}
+                <a href="{{ url_for('download_json') }}" class="btn btn-secondary">Download JSON report</a>
+            {% endif %}
+        </div>
     </form>
-  </main>
+
+    {% if metrics %}
+        <div class="metrics">
+            <strong>Scan summary</strong><br>
+            Engine: <code>{{ metrics.scan_engine }}</code> |
+            CIDRs: {{ metrics.cidrs|join(', ') }} |
+            Duration: {{ "%.2f"|format(metrics.duration_seconds) }} s<br>
+            Hosts: {{ metrics.num_hosts }} |
+            Hosts with IoC tags: {{ metrics.num_ioc_hosts }} |
+            Priority: H {{ metrics.priority_counts.high }}, M {{ metrics.priority_counts.medium }}, L {{ metrics.priority_counts.low }}
+        </div>
+    {% endif %}
+
+    {% if hosts %}
+        <h2>Host findings</h2>
+        <table>
+            <thead>
+                <tr>
+                    <th>IP</th>
+                    <th>Hostname</th>
+                    <th>OS (guess)</th>
+                    <th>Risk</th>
+                    <th>Tags</th>
+                    <th>Open services</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for h in hosts %}
+                    {% set cls = "" %}
+                    {% if "priority:high" in h.tags %}
+                        {% set cls = "risk-high" %}
+                    {% elif "priority:medium" in h.tags %}
+                        {% set cls = "risk-medium" %}
+                    {% elif "priority:low" in h.tags %}
+                        {% set cls = "risk-low" %}
+                    {% endif %}
+                    <tr class="{{ cls }}">
+                        <td>{{ h.ip }}</td>
+                        <td>{{ h.hostname }}</td>
+                        <td>{{ h.os_guess }}</td>
+                        <td>{{ h.risk_score }}</td>
+                        <td>{{ h.tags|join(", ") }}</td>
+                        <td>
+                            {% for s in h.services %}
+                                <div>
+                                    {{ s.port }}/{{ s.protocol }}
+                                    {% if s.name %} {{ s.name }}{% endif %}
+                                    {% if s.product %} ({{ s.product }}{% if s.version %} {{ s.version }}{% endif %}){% endif %}
+                                </div>
+                            {% endfor %}
+                        </td>
+                    </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    {% endif %}
+
+    {% if report_json %}
+        <details>
+            <summary>Raw JSON report</summary>
+            <pre>{{ report_json }}</pre>
+        </details>
+    {% endif %}
 </body>
 </html>

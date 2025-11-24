@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""
-BadBox / Android IoT hunter – scans local networks and (optionally) packet
-captures for suspicious devices and flows.
+# -*- coding: utf-8 -*-
 
-Defensive use only: only run against networks and devices you own or have
-explicit permission to test.
+"""BadBox Hunter v3 (with Web UI hooks)
+
+Network- and PCAP-based triage tool to help detect compromised / backdoored
+Android, IoT and other devices on small networks.
 """
 
 import argparse
@@ -12,506 +12,639 @@ import ipaddress
 import json
 import logging
 import subprocess
+import threading
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Any
-
-try:
-    import paramiko  # SSH client (optional)
-except ImportError:  # pragma: no cover
-    paramiko = None
+from typing import Any, Dict, List, Optional, Set
 
 from ioc_store import IoCStore
+from pcap_analyzer import analyse_pcap, PCAPAnalysisResult
 
 LOG = logging.getLogger("badbox_hunter")
 
 
-# ------------------------------
-# Data classes
-# ------------------------------
+# ---------------------------------------------------------------------------
+# Data models
+# ---------------------------------------------------------------------------
 
 
 @dataclass
-class HostService:
+class ServiceInfo:
     port: int
     protocol: str
-    service: str
-    banner: str = ""
+    name: str
+    product: str = ""
+    version: str = ""
 
 
 @dataclass
 class HostInfo:
     ip: str
-    hostname: Optional[str] = None
-    mac: Optional[str] = None
-    os_guess: Optional[str] = None
-    services: List[HostService] = field(default_factory=list)
+    hostname: str = ""
+    os_guess: str = ""
+    services: List[ServiceInfo] = field(default_factory=list)
     tags: List[str] = field(default_factory=list)
-    ioc_hits: Dict[str, Any] = field(default_factory=dict)
+    risk_score: int = 0
+    notes: Dict[str, Any] = field(default_factory=dict)
 
 
-# ------------------------------
-# Network scanning
-# ------------------------------
+# ---------------------------------------------------------------------------
+# Nmap-based scanner
+# ---------------------------------------------------------------------------
 
 
 class NetworkScanner:
-    """Wrapper around nmap. Requires nmap installed."""
+    """Wrapper around nmap.
 
-    def __init__(self, cidrs: List[str], exclude_ips: Optional[List[str]] = None):
+    Default scan engine. Conservative and WSL/NAT friendly.
+    """
+
+    def __init__(
+        self,
+        cidrs: List[str],
+        exclude_ips: Optional[List[str]] = None,
+        max_retries: int = 1,
+        host_timeout: str = "60s",
+    ) -> None:
         self.cidrs = cidrs
-        self.exclude_ips = set(exclude_ips or [])
+        self.exclude_ips = exclude_ips or []
+        self.max_retries = max_retries
+        self.host_timeout = host_timeout
 
     def scan(self) -> List[HostInfo]:
         hosts: List[HostInfo] = []
         for cidr in self.cidrs:
             LOG.info("Scanning network %s with nmap, this may take a while...", cidr)
-            cmd = ["nmap", "-sS", "-sV", "-O", "-oX", "-", cidr]
-            # WSL alternative cmd = ["nmap", "-sT", "-sV", "-O", "-Pn", "-oX", "-", cidr]
+            cmd = [
+                "nmap",
+                "-sT",
+                "-sV",
+                "-Pn",
+                "-T3",
+                "--max-retries",
+                str(self.max_retries),
+                "--host-timeout",
+                self.host_timeout,
+                "-oX",
+                "-",
+                cidr,
+            ]
+
+            stop_event = threading.Event()
+
+            def progress() -> None:
+                dots = 0
+                while not stop_event.is_set():
+                    dots = (dots % 10) + 1
+                    suffix = "." * dots
+                    LOG.info("nmap still scanning %s%s", cidr, suffix)
+                    time.sleep(10)
+
+            t = threading.Thread(target=progress, daemon=True)
+            t.start()
+
             try:
                 proc = subprocess.run(
-                    cmd, capture_output=True, text=True, check=True
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    check=True,
                 )
             except FileNotFoundError:
                 LOG.error("nmap not found. Please install nmap and try again.")
+                stop_event.set()
+                t.join(timeout=1)
                 raise
             except subprocess.CalledProcessError as e:
-                LOG.error("nmap failed: %s", e)
+                stop_event.set()
+                t.join(timeout=1)
+                stderr = e.stderr or ""
+                LOG.error(
+                    "nmap failed for %s (exit %s). stderr:\n%s",
+                    cidr,
+                    e.returncode,
+                    stderr,
+                )
                 continue
-
-            xml_output = proc.stdout
-            hosts.extend(self._parse_nmap_xml(xml_output))
+            else:
+                stop_event.set()
+                t.join(timeout=1)
+                xml_output = proc.stdout
+                hosts.extend(self._parse_nmap_xml(xml_output))
 
         hosts = [h for h in hosts if h.ip not in self.exclude_ips]
         return hosts
 
-    @staticmethod
-    def _parse_nmap_xml(xml_output: str) -> List[HostInfo]:
+    def _parse_nmap_xml(self, xml_output: str) -> List[HostInfo]:
         import xml.etree.ElementTree as ET
 
-        host_infos: List[HostInfo] = []
-        root = ET.fromstring(xml_output)
-        for host in root.findall("host"):
-            status_el = host.find("status")
-            if status_el is not None and status_el.get("state") != "up":
+        hosts: List[HostInfo] = []
+        try:
+            root = ET.fromstring(xml_output)
+        except ET.ParseError:
+            LOG.error("Failed to parse nmap XML output.")
+            return hosts
+
+        for host_el in root.findall("host"):
+            status = host_el.find("status")
+            if status is not None and status.get("state") != "up":
                 continue
 
-            addr = host.find("address[@addrtype='ipv4']")
-            if addr is None:
+            addr_el = host_el.find("address")
+            if addr_el is None or addr_el.get("addrtype") != "ipv4":
                 continue
-            ip = addr.get("addr")
+            ip = addr_el.get("addr")
             if not ip:
                 continue
 
-            hi = HostInfo(ip=ip)
+            hostname = ""
+            hostnames_el = host_el.find("hostnames")
+            if hostnames_el is not None:
+                hn_el = hostnames_el.find("hostname")
+                if hn_el is not None:
+                    hostname = hn_el.get("name") or ""
 
-            hostname_el = host.find("hostnames/hostname")
-            if hostname_el is not None:
-                hi.hostname = hostname_el.get("name")
-
-            os_el = host.find("os/osmatch")
+            os_guess = ""
+            os_el = host_el.find("os")
             if os_el is not None:
-                hi.os_guess = os_el.get("name")
+                osmatch = os_el.find("osmatch")
+                if osmatch is not None:
+                    os_guess = osmatch.get("name") or ""
 
-            for port_el in host.findall("ports/port"):
-                portid = int(port_el.get("portid"))
-                proto = port_el.get("protocol") or "tcp"
-
-                state_el = port_el.find("state")
-                if state_el is not None and state_el.get("state") != "open":
-                    continue
-
-                service_el = port_el.find("service")
-                service_name = (
-                    service_el.get("name") if service_el is not None else "unknown"
-                )
-
-                banner = ""
-                if service_el is not None:
-                    product = service_el.get("product") or ""
-                    version = service_el.get("version") or ""
-                    extrainfo = service_el.get("extrainfo") or ""
-                    banner = " ".join(x for x in [product, version, extrainfo] if x)
-
-                hi.services.append(
-                    HostService(
-                        port=portid,
-                        protocol=proto,
-                        service=service_name,
-                        banner=banner,
+            services: List[ServiceInfo] = []
+            ports_el = host_el.find("ports")
+            if ports_el is not None:
+                for port_el in ports_el.findall("port"):
+                    state_el = port_el.find("state")
+                    if state_el is None or state_el.get("state") != "open":
+                        continue
+                    portid = int(port_el.get("portid") or 0)
+                    proto = port_el.get("protocol") or "tcp"
+                    svc_el = port_el.find("service")
+                    name = ""
+                    product = ""
+                    version = ""
+                    if svc_el is not None:
+                        name = svc_el.get("name") or ""
+                        product = svc_el.get("product") or ""
+                        version = svc_el.get("version") or ""
+                    services.append(
+                        ServiceInfo(
+                            port=portid,
+                            protocol=proto,
+                            name=name,
+                            product=product,
+                            version=version,
+                        )
                     )
+
+            hosts.append(
+                HostInfo(
+                    ip=ip,
+                    hostname=hostname,
+                    os_guess=os_guess,
+                    services=services,
                 )
-
-            host_infos.append(hi)
-        return host_infos
-
-
-# ------------------------------
-# SSH enrichment
-# ------------------------------
+            )
+        return hosts
 
 
-class SSHInspector:
-    """Optional SSH enrichment.
+# ---------------------------------------------------------------------------
+# Masscan + parallel nmap scanner
+# ---------------------------------------------------------------------------
 
-    Inventory JSON format:
-    [
-      {"ip": "192.168.1.10", "user": "root", "auth": "key", "key_path": "~/.ssh/id_rsa"},
-      {"ip": "192.168.1.11", "user": "pi", "auth": "password", "password": "s3cret"}
-    ]
-    """
 
-    def __init__(self, inventory_path: Optional[Path]):
-        self.inventory_path = inventory_path
-        self.inventory = self._load_inventory() if inventory_path else []
+class MasscanFastScanner(NetworkScanner):
+    """Fast scanner using masscan for host discovery then parallel nmap."""
 
-    def _load_inventory(self) -> List[Dict[str, Any]]:
-        if not self.inventory_path.exists():
-            LOG.warning(
-                "SSH inventory %s not found; SSH checks disabled", self.inventory_path
+    def __init__(
+        self,
+        cidrs: List[str],
+        exclude_ips: Optional[List[str]] = None,
+        ports: Optional[List[int]] = None,
+        rate: int = 5000,
+        workers: int = 8,
+        max_retries: int = 1,
+        host_timeout: str = "60s",
+    ) -> None:
+        super().__init__(
+            cidrs=cidrs,
+            exclude_ips=exclude_ips,
+            max_retries=max_retries,
+            host_timeout=host_timeout,
+        )
+        self.ports = ports or [22, 23, 53, 80, 443, 8080, 8443, 5554, 5555]
+        self.rate = rate
+        self.workers = workers
+
+    def _run_masscan(self, cidr: str) -> Set[str]:
+        port_spec = ",".join(str(p) for p in self.ports)
+        cmd = [
+            "masscan",
+            "-p",
+            port_spec,
+            "--rate",
+            str(self.rate),
+            "--wait",
+            "5",
+            "-oJ",
+            "-",
+            cidr,
+        ]
+        LOG.info("Running masscan on %s (ports %s, rate %s)...", cidr, port_spec, self.rate)
+        try:
+            proc = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+        except FileNotFoundError:
+            LOG.error("masscan not found. Please install masscan and try again.")
+            raise
+        except subprocess.CalledProcessError as e:
+            stderr = e.stderr or ""
+            LOG.error(
+                "masscan failed for %s (exit %s). stderr:\n%s",
+                cidr,
+                e.returncode,
+                stderr,
+            )
+            return set()
+
+        raw = proc.stdout.strip()
+        if not raw:
+            return set()
+
+        discovered_ips: Set[str] = set()
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            LOG.error("Failed to decode masscan JSON output for %s", cidr)
+            return set()
+
+        for entry in data:
+            ip = entry.get("ip")
+            if not ip:
+                continue
+            discovered_ips.add(ip)
+
+        LOG.info("masscan discovered %d candidate hosts in %s", len(discovered_ips), cidr)
+        return discovered_ips
+
+    def _scan_host_with_nmap(self, ip: str) -> List[HostInfo]:
+        if ip in self.exclude_ips:
+            return []
+        LOG.info("nmap scanning host %s ...", ip)
+        cmd = [
+            "nmap",
+            "-sT",
+            "-sV",
+            "-Pn",
+            "-T3",
+            "--max-retries",
+            str(self.max_retries),
+            "--host-timeout",
+            self.host_timeout,
+            "-oX",
+            "-",
+            ip,
+        ]
+        try:
+            proc = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+        except subprocess.CalledProcessError as e:
+            stderr = e.stderr or ""
+            LOG.error(
+                "nmap failed for host %s (exit %s). stderr:\n%s",
+                ip,
+                e.returncode,
+                stderr,
             )
             return []
-        with self.inventory_path.open("r", encoding="utf-8") as f:
-            data = json.load(f)
-        return data
+        except FileNotFoundError:
+            LOG.error("nmap not found. Please install nmap and try again.")
+            raise
 
-    def enrich_host(self, host: HostInfo) -> None:
-        if paramiko is None:
-            LOG.debug("paramiko not installed, skipping SSH for %s", host.ip)
-            return
+        xml_output = proc.stdout
+        return self._parse_nmap_xml(xml_output)
 
-        entry = next((e for e in self.inventory if e.get("ip") == host.ip), None)
-        if not entry:
-            return
+    def scan(self) -> List[HostInfo]:
+        all_ips: Set[str] = set()
+        for cidr in self.cidrs:
+            ips = self._run_masscan(cidr)
+            all_ips.update(ips)
 
-        ssh = paramiko.SSHClient()
-        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        try:
-            if entry.get("auth") == "key":
-                key_path = Path(entry["key_path"]).expanduser()
-                ssh.connect(
-                    host.ip,
-                    username=entry["user"],
-                    key_filename=str(key_path),
-                    timeout=10,
-                )
-            else:
-                ssh.connect(
-                    host.ip,
-                    username=entry["user"],
-                    password=entry["password"],
-                    timeout=10,
-                )
-        except Exception as e:  # noqa: BLE001
-            LOG.warning("SSH connection to %s failed: %s", host.ip, e)
-            return
+        if not all_ips:
+            LOG.info("No hosts discovered by masscan.")
+            return []
 
-        try:
-            commands = {
-                "uname": "uname -a",
-                "ps": "ps auxw | head -n 25",
-                "netstat": "netstat -tunp 2>/dev/null | head -n 25",
-            }
-            for key, cmd in commands.items():
-                stdin, stdout, stderr = ssh.exec_command(cmd, timeout=10)
-                output = stdout.read().decode("utf-8", errors="ignore")
-                setattr(host, f"ssh_{key}", output)
-        finally:
-            ssh.close()
-
-
-# ------------------------------
-# Analysis
-# ------------------------------
-
-
-class Analyzer:
-    """Applies tagging and IoC matching to hosts."""
-
-    def __init__(self, iocs: IoCStore):
-        self.iocs = iocs
-
-    def analyse(self, hosts: List[HostInfo]) -> None:
-        for host in hosts:
-            self._tag_host(host)
-            self._match_iocs(host)
-
-    def _tag_host(self, host: HostInfo) -> None:
-        ip = ipaddress.ip_address(host.ip)
-        if ip.is_private:
-            host.tags.append("private-net")
-
-        for svc in host.services:
-            if svc.port == 5555:
-                host.tags.append("adb-exposed")
-            if svc.port in (22, 2222):
-                host.tags.append("ssh")
-            if svc.port in (23, 2323):
-                host.tags.append("telnet")
-            if svc.service in ("http", "http-alt", "https"):
-                host.tags.append("http-ui")
-
-        if host.os_guess and "android" in host.os_guess.lower():
-            host.tags.append("android-ish")
-
-        host.tags = sorted(set(host.tags))
-
-    def _match_iocs(self, host: HostInfo) -> None:
-        banner_hits: List[str] = []
-        for svc in host.services:
-            if svc.banner:
-                hits = self.iocs.match_banner(svc.banner)
-                if hits:
-                    banner_hits.extend(hits)
-
-        if banner_hits:
-            host.ioc_hits["banners"] = sorted(set(banner_hits))
-
-
-# ------------------------------
-# Reporting
-# ------------------------------
-
-
-class Reporter:
-    def __init__(self, output_path: Path):
-        self.output_path = output_path
-
-    def to_dicts(self, hosts: List[HostInfo]) -> List[Dict[str, Any]]:
-        data: List[Dict[str, Any]] = []
-        for h in hosts:
-            entry: Dict[str, Any] = {
-                "ip": h.ip,
-                "hostname": h.hostname,
-                "os_guess": h.os_guess,
-                "tags": h.tags,
-                "ioc_hits": h.ioc_hits,
-                "services": [
-                    {
-                        "port": s.port,
-                        "protocol": s.protocol,
-                        "service": s.service,
-                        "banner": s.banner,
-                    }
-                    for s in h.services
-                ],
-            }
-            for key in ("ssh_uname", "ssh_ps", "ssh_netstat"):
-                if hasattr(h, key):
-                    entry[key] = getattr(h, key)
-            data.append(entry)
-        return data
-
-    def write(self, hosts: List[HostInfo]) -> None:
-        data = self.to_dicts(hosts)
-        self.output_path.write_text(
-            json.dumps(data, indent=2), encoding="utf-8"
-        )
-        LOG.info("Wrote report for %d hosts to %s", len(hosts), self.output_path)
-
-
-# ------------------------------
-# Assessment helper (reusable from web UI)
-# ------------------------------
-
-
-def calculate_risk_score(host: HostInfo) -> Dict[str, Any]:
-    """Simple heuristic scoring for hosts.
-
-    Returns a dict with 'score' and 'level' (Low/Medium/High).
-    """
-    score = 0
-    tags = set(host.tags)
-    ioc_hits = host.ioc_hits or {}
-
-    if "adb-exposed" in tags:
-        score += 3
-    if "telnet" in tags:
-        score += 3
-    if "pcap-suspicious-traffic" in tags:
-        score += 2
-    if "android-ish" in tags:
-        score += 1
-    if "http-ui" in tags:
-        score += 1
-
-    if "banners" in ioc_hits and ioc_hits["banners"]:
-        score += 2
-    if "pcap_flows" in ioc_hits and ioc_hits["pcap_flows"]:
-        score += 3
-
-    if score >= 7:
-        level = "High"
-    elif score >= 4:
-        level = "Medium"
-    else:
-        level = "Low"
-
-    return {"score": score, "level": level}
-
-
-def run_assessment(
-    cidrs: List[str],
-    ioc_dir: Path,
-    exclude_ips: Optional[List[str]] = None,
-    ssh_inventory: Optional[Path] = None,
-    pcaps: Optional[List[Path]] = None,
-    capture_iface: Optional[str] = None,
-    capture_seconds: int = 60,
-) -> List[HostInfo]:
-    """Programmatic assessment entry-point.
-
-    Used by the CLI and the web UI.
-    """
-    iocs = IoCStore(ioc_dir)
-    scanner = NetworkScanner(cidrs, exclude_ips=exclude_ips or [])
-    ssh_inspector = SSHInspector(ssh_inventory)
-    analyzer = Analyzer(iocs)
-
-    final_pcaps: List[Path] = list(pcaps or [])
-    if capture_iface:
-        tmp_pcap = Path(f"capture_{capture_iface}.pcap")
         LOG.info(
-            "Starting live capture on %s for %d seconds -> %s",
-            capture_iface,
-            capture_seconds,
-            tmp_pcap,
+            "Running nmap against %d discovered hosts with %d workers...",
+            len(all_ips),
+            self.workers,
         )
-        cmd = [
-            "tcpdump",
-            "-i", capture_iface,
-            "-w", str(tmp_pcap),
-            "-s", "0",
-            "-G", str(capture_seconds),
-            "-W", "1",
-        ]
-        proc = subprocess.run(cmd)
-        if proc.returncode != 0:
-            LOG.error("tcpdump failed with code %s", proc.returncode)
-        else:
-            final_pcaps.append(tmp_pcap)
+        hosts: List[HostInfo] = []
 
-    hosts = scanner.scan()
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        with ThreadPoolExecutor(max_workers=self.workers) as executor:
+            future_to_ip = {
+                executor.submit(self._scan_host_with_nmap, ip): ip
+                for ip in sorted(all_ips)
+            }
+            for future in as_completed(future_to_ip):
+                ip = future_to_ip[future]
+                try:
+                    host_infos = future.result()
+                except Exception as e:
+                    LOG.error("Error scanning host %s with nmap: %s", ip, e)
+                    continue
+                hosts.extend(host_infos)
+
+        hosts = [h for h in hosts if h.ip not in self.exclude_ips]
+        LOG.info("Completed fast scan, %d hosts total after exclusions.", len(hosts))
+        return hosts
+
+
+# ---------------------------------------------------------------------------
+# Risk scoring, enrichment and PCAP integration
+# ---------------------------------------------------------------------------
+
+
+def enrich_hosts_with_iocs(hosts: List[HostInfo], iocs: IoCStore) -> None:
+    """Add IoC-based tags and a simple risk score to each host."""
     for host in hosts:
-        ssh_inspector.enrich_host(host)
-    analyzer.analyse(hosts)
+        score = host.risk_score
+        tags: List[str] = []
 
-    if final_pcaps:
-        from pcap_analyzer import PcapAnalyzer
+        if iocs.match_ip(host.ip):
+            tags.append("ioc:ip")
+            score += 50
 
-        p_analyzer = PcapAnalyzer(iocs)
-        flows = p_analyzer.analyze_files(final_pcaps)
+        for svc in host.services:
+            banner = f"{svc.name} {svc.product} {svc.version}".strip()
+            if banner and iocs.match_banner(banner):
+                tags.append(f"ioc:banner:{svc.port}")
+                score += 20
+            if svc.port in (5554, 5555):
+                tags.append("suspicious:adb-tcp")
+                score += 15
+            if svc.name and svc.name.lower() == "telnet":
+                tags.append("suspicious:telnet")
+                score += 10
 
-        ip_to_host = {h.ip: h for h in hosts}
-        for flow in flows:
-            h = ip_to_host.get(flow.src_ip) or ip_to_host.get(flow.dst_ip)
-            if not h:
+        if score >= 60:
+            tags.append("priority:high")
+        elif score >= 30:
+            tags.append("priority:medium")
+        elif score > 0:
+            tags.append("priority:low")
+
+        host.tags = sorted(set(host.tags + tags))
+        host.risk_score = score
+
+def integrate_pcap(hosts: List[HostInfo], pcap_result: PCAPAnalysisResult) -> None:
+    if not pcap_result.flows:
+        return
+
+    host_by_ip: Dict[str, HostInfo] = {h.ip: h for h in hosts}
+
+    for flow in pcap_result.flows:
+        for key in ("src_ip", "dst_ip"):
+            ip = flow.get(key)
+            if not ip:
                 continue
-            h.tags.append("pcap-suspicious-traffic")
-            h.tags = sorted(set(h.tags))
-            h.ioc_hits.setdefault("pcap_flows", [])
-            h.ioc_hits["pcap_flows"].append(
-                {
-                    "src_ip": flow.src_ip,
-                    "dst_ip": flow.dst_ip,
-                    "dst_port": flow.dst_port,
-                    "proto": flow.proto,
-                    "reasons": flow.reasons,
-                    "matched_iocs": flow.matched_iocs,
-                }
-            )
-
-    for h in hosts:
-        risk = calculate_risk_score(h)
-        h.ioc_hits.setdefault("risk", risk)
-
-    return hosts
+            host = host_by_ip.get(ip)
+            if not host:
+                continue
+            host.notes.setdefault("pcap_ioc_flows", []).append(flow)
+            if "ioc:pcap" not in host.tags:
+                host.tags.append("ioc:pcap")
+            host.risk_score = max(host.risk_score, host.risk_score + 10)
 
 
-# ------------------------------
-# CLI entrypoint
-# ------------------------------
+# ---------------------------------------------------------------------------
+# Metrics helper
+# ---------------------------------------------------------------------------
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(
-        description=(
-            "BadBox / Android IoT hunter – scans local network and "
-            "checks for suspicious devices (defensive use only)."
-        )
-    )
+def compute_metrics(
+    hosts: List[HostInfo],
+    scan_engine: str,
+    cidrs: List[str],
+    max_retries: int,
+    timeout_per_host: str,
+    duration_seconds: float,
+) -> Dict[str, Any]:
+    num_hosts = len(hosts)
+    num_ioc_hosts = sum(1 for h in hosts if any(t.startswith("ioc:") for t in h.tags))
+    num_high = sum(1 for h in hosts if "priority:high" in h.tags)
+    num_medium = sum(1 for h in hosts if "priority:medium" in h.tags)
+    num_low = sum(1 for h in hosts if "priority:low" in h.tags)
+
+    metrics: Dict[str, Any] = {
+        "num_hosts": num_hosts,
+        "num_ioc_hosts": num_ioc_hosts,
+        "priority_counts": {
+            "high": num_high,
+            "medium": num_medium,
+            "low": num_low,
+        },
+        "scan_engine": scan_engine,
+        "cidrs": cidrs,
+        "max_retries": max_retries,
+        "timeout_per_host": timeout_per_host,
+        "duration_seconds": duration_seconds,
+    }
+    return metrics
+
+
+# ---------------------------------------------------------------------------
+# CLI + orchestrator
+# ---------------------------------------------------------------------------
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="BadBox Hunter v3")
     parser.add_argument(
         "--cidr",
         action="append",
         required=True,
-        help="CIDR(s) to scan, e.g. --cidr 192.168.1.0/24 (repeatable).",
+        help="CIDR range to scan (can be specified multiple times).",
     )
     parser.add_argument(
         "--exclude-ip",
         action="append",
         default=[],
-        help="IP to exclude (can be repeated).",
+        help="IP address to exclude from results (can be specified multiple times).",
     )
     parser.add_argument(
         "--ioc-dir",
         type=Path,
         default=Path("iocs"),
-        help="Directory containing IoC text files.",
+        help="Directory containing IoC flat files (default: iocs).",
     )
     parser.add_argument(
-        "--ssh-inventory",
+        "--pcap",
         type=Path,
-        default=None,
-        help="Optional JSON inventory with SSH credentials.",
+        help="Optional PCAP file to analyse and correlate with hosts.",
+    )
+    parser.add_argument(
+        "--scan-engine",
+        choices=["nmap", "masscan"],
+        default="nmap",
+        help="Scan engine to use. 'masscan' uses masscan for fast host discovery then parallel nmap.",
+    )
+    parser.add_argument(
+        "--max-retries",
+        type=int,
+        default=1,
+        help="Maximum nmap retries per port (default: 1).",
+    )
+    parser.add_argument(
+        "--timeout-per-host",
+        type=str,
+        default="60s",
+        help="Nmap host timeout per host, e.g. '30s', '2m' (default: 60s).",
     )
     parser.add_argument(
         "--output",
         type=Path,
         default=Path("badbox_report.json"),
-        help="Path for JSON output report.",
+        help="Output JSON report path (default: badbox_report.json).",
     )
     parser.add_argument(
-        "--pcap",
-        type=Path,
-        action="append",
-        default=[],
-        help="PCAP file to analyze (repeatable).",
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="Enable verbose logging.",
     )
-    parser.add_argument(
-        "--capture-iface",
-        type=str,
-        default=None,
-        help="Optional interface for live tcpdump capture.",
-    )
-    parser.add_argument(
-        "--capture-seconds",
-        type=int,
-        default=60,
-        help="Duration for live capture in seconds (with --capture-iface).",
-    )
-    parser.add_argument(
-        "-v", "--verbose", action="store_true", help="Enable verbose logging."
-    )
-    args = parser.parse_args()
+    return parser.parse_args()
 
+
+def run_assessment(
+    cidrs: List[str],
+    exclude_ips: List[str],
+    ioc_dir: Path,
+    scan_engine: str,
+    max_retries: int,
+    timeout_per_host: str,
+    pcap_path: Optional[Path] = None,
+) -> List[HostInfo]:
+    """Main orchestrator used by both CLI and web UI."""
+    normalised_cidrs: List[str] = []
+    for cidr in cidrs:
+        try:
+            net = ipaddress.ip_network(cidr, strict=False)
+        except ValueError as e:
+            LOG.error("Invalid CIDR %s: %s", cidr, e)
+            continue
+        normalised_cidrs.append(str(net))
+    if not normalised_cidrs:
+        LOG.error("No valid CIDRs to scan; aborting.")
+        return []
+
+    iocs = IoCStore(ioc_dir=ioc_dir)
+    iocs.load()
+
+    if scan_engine == "masscan":
+        scanner = MasscanFastScanner(
+            cidrs=normalised_cidrs,
+            exclude_ips=exclude_ips,
+            max_retries=max_retries,
+            host_timeout=timeout_per_host,
+        )
+    else:
+        scanner = NetworkScanner(
+            cidrs=normalised_cidrs,
+            exclude_ips=exclude_ips,
+            max_retries=max_retries,
+            host_timeout=timeout_per_host,
+        )
+
+    hosts = scanner.scan()
+
+    if pcap_path is not None:
+        pcap_result = analyse_pcap(pcap_path, iocs)
+        integrate_pcap(hosts, pcap_result)
+
+    enrich_hosts_with_iocs(hosts, iocs)
+    return hosts
+
+
+def hosts_to_json(hosts: List[HostInfo]) -> List[Dict[str, Any]]:
+    data: List[Dict[str, Any]] = []
+    for h in hosts:
+        data.append(
+            {
+                "ip": h.ip,
+                "hostname": h.hostname,
+                "os_guess": h.os_guess,
+                "services": [
+                    {
+                        "port": s.port,
+                        "protocol": s.protocol,
+                        "name": s.name,
+                        "product": s.product,
+                        "version": s.version,
+                    }
+                    for s in h.services
+                ],
+                "tags": h.tags,
+                "risk_score": h.risk_score,
+                "notes": h.notes,
+            }
+        )
+    return data
+
+
+def main() -> None:
+    args = parse_args()
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
+    LOG.info("Starting BadBox Hunter v3")
 
-    reporter = Reporter(args.output)
-
+    start_ts = time.time()
     hosts = run_assessment(
         cidrs=args.cidr,
-        ioc_dir=args.ioc_dir,
         exclude_ips=args.exclude_ip,
-        ssh_inventory=args.ssh_inventory,
-        pcaps=args.pcap,
-        capture_iface=args.capture_iface,
-        capture_seconds=args.capture_seconds,
+        ioc_dir=args.ioc_dir,
+        scan_engine=args.scan_engine,
+        max_retries=args.max_retries,
+        timeout_per_host=args.timeout_per_host,
+        pcap_path=args.pcap,
+    )
+    duration = time.time() - start_ts
+
+    metrics = compute_metrics(
+        hosts=hosts,
+        scan_engine=args.scan_engine,
+        cidrs=args.cidr,
+        max_retries=args.max_retries,
+        timeout_per_host=args.timeout_per_host,
+        duration_seconds=duration,
     )
 
-    reporter.write(hosts)
+    report_data = {
+        "hosts": hosts_to_json(hosts),
+        "meta": metrics,
+    }
+
+    args.output.write_text(json.dumps(report_data, indent=2), encoding="utf-8")
+    LOG.info(
+        "Wrote report for %d hosts to %s (duration %.2fs)",
+        len(hosts),
+        args.output,
+        duration,
+    )
 
 
 if __name__ == "__main__":
